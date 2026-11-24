@@ -382,10 +382,12 @@ jobs:
           gradle-version: "8.7"
 
       - name: Build release APK (arm64 only, optimized)
-        run: gradle :app:assembleRelease -Pandroid.injected.build.abi=arm64-v8a --stacktrace
+        run: gradle :app:assembleRelease --console=plain --stacktrace
 
       - name: Show where the APK is
-        run: find . -name "*.apk" -not -path "./whisper.cpp/*"
+        run: |
+          ls -R app/build/outputs || true
+          find . -name "*.apk" -not -path "./whisper.cpp/*" || true
 
       - uses: actions/upload-artifact@v4
         with:
