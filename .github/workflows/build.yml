@@ -1,0 +1,389 @@
+name: Build Whisper GGUF APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get whisper.cpp (the engine)
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp
+          ls whisper.cpp/examples/whisper.android
+          # let the engine auto-detect language (default in the sample is English only)
+          grep -rl 'params.language = "en"' whisper.cpp/examples/whisper.android/lib/src/main/jni | xargs -r sed -i 's/params.language = "en"/params.language = "auto"/' || true
+
+      - name: Generate the app project
+        run: |
+          mkdir -p app/src/main/java/com/example/whispergguf
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "WhisperGGUF"
+          include ':app'
+          include ':lib'
+          project(':lib').projectDir = new File(settingsDir, 'whisper.cpp/examples/whisper.android/lib')
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'com.android.library' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.example.whispergguf'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.whispergguf'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+              implementation project(':lib')
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <application
+                  android:label="Whisper GGUF"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:largeHeap="true">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/whispergguf/MainActivity.kt <<'EOF'
+          package com.example.whispergguf
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.media.MediaRecorder
+          import android.net.Uri
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import com.whispercpp.whisper.WhisperContext
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+
+          class MainActivity : Activity() {
+              private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+              private var ctx: WhisperContext? = null
+              private lateinit var status: TextView
+              private lateinit var output: TextView
+              private lateinit var recBtn: Button
+              @Volatile private var recording = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad * 2, pad, pad)
+
+                  status = TextView(this)
+                  status.text = "No model loaded"
+                  val modelBtn = Button(this)
+                  modelBtn.text = "1. Pick model file (.gguf / .bin)"
+                  val audioBtn = Button(this)
+                  audioBtn.text = "2. Pick audio file to transcribe"
+                  recBtn = Button(this)
+                  recBtn.text = "Or record with microphone"
+                  output = TextView(this)
+                  output.setTextIsSelectable(true)
+                  output.textSize = 16f
+                  val scroll = ScrollView(this)
+                  scroll.addView(output)
+
+                  root.addView(status)
+                  root.addView(modelBtn)
+                  root.addView(audioBtn)
+                  root.addView(recBtn)
+                  root.addView(scroll)
+                  setContentView(root)
+
+                  modelBtn.setOnClickListener { pick(1, "*/*") }
+                  audioBtn.setOnClickListener { pick(2, "audio/*") }
+                  recBtn.setOnClickListener { toggleRecord() }
+
+                  if (File(filesDir, "model.bin").exists()) openModel()
+              }
+
+              private fun pick(code: Int, type: String) {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = type
+                  startActivityForResult(i, code)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  val uri = data?.data
+                  if (resultCode != RESULT_OK || uri == null) return
+                  if (requestCode == 1) copyModel(uri) else if (requestCode == 2) transcribeFile(uri)
+              }
+
+              private fun copyModel(uri: Uri) {
+                  status.text = "Copying model (one time)..."
+                  scope.launch {
+                      try {
+                          withContext(Dispatchers.IO) {
+                              val f = File(filesDir, "model.bin")
+                              contentResolver.openInputStream(uri)!!.use { input ->
+                                  f.outputStream().use { out -> input.copyTo(out) }
+                              }
+                          }
+                          openModel()
+                      } catch (e: Throwable) {
+                          status.text = "Copy failed: " + e.message
+                      }
+                  }
+              }
+
+              private fun openModel() {
+                  status.text = "Loading model..."
+                  scope.launch {
+                      try {
+                          ctx?.release()
+                          ctx = null
+                          val path = File(filesDir, "model.bin").absolutePath
+                          ctx = withContext(Dispatchers.IO) { WhisperContext.createContextFromFile(path) }
+                          status.text = "Model ready. Pick or record audio."
+                      } catch (e: Throwable) {
+                          status.text = "Model failed to load (wrong format? whisper.cpp needs its ggml .bin format): " + e.message
+                      }
+                  }
+              }
+
+              private fun transcribeFile(uri: Uri) {
+                  status.text = "Decoding audio..."
+                  scope.launch {
+                      try {
+                          val pcm = withContext(Dispatchers.IO) { decodeAudio(uri) }
+                          transcribe(pcm)
+                      } catch (e: Throwable) {
+                          status.text = "Audio error: " + e.message
+                      }
+                  }
+              }
+
+              private fun transcribe(data: FloatArray) {
+                  val c = ctx
+                  if (c == null) {
+                      status.text = "Load a model first"
+                      return
+                  }
+                  status.text = "Transcribing (" + (data.size / 16000) + " s of audio)..."
+                  scope.launch {
+                      try {
+                          val text = c.transcribeData(data)
+                          output.text = text
+                          status.text = "Done"
+                      } catch (e: Throwable) {
+                          status.text = "Transcription failed: " + e.message
+                      }
+                  }
+              }
+
+              private fun toggleRecord() {
+                  if (recording) {
+                      recording = false
+                      recBtn.text = "Or record with microphone"
+                      return
+                  }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 3)
+                      return
+                  }
+                  val minBuf = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                  val rec = AudioRecord(MediaRecorder.AudioSource.MIC, 16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 2)
+                  val bos = ByteArrayOutputStream()
+                  recording = true
+                  recBtn.text = "Stop recording"
+                  rec.startRecording()
+                  Thread {
+                      val b = ByteArray(minBuf)
+                      while (recording) {
+                          val n = rec.read(b, 0, b.size)
+                          if (n > 0) bos.write(b, 0, n)
+                      }
+                      rec.stop()
+                      rec.release()
+                      val sb = ByteBuffer.wrap(bos.toByteArray()).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                      val f = FloatArray(sb.remaining())
+                      for (i in f.indices) f[i] = sb.get(i) / 32768f
+                      runOnUiThread { transcribe(f) }
+                  }.start()
+              }
+
+              private fun decodeAudio(uri: Uri): FloatArray {
+                  val ex = MediaExtractor()
+                  ex.setDataSource(this, uri, null)
+                  var idx = -1
+                  var fmt: MediaFormat? = null
+                  for (i in 0 until ex.trackCount) {
+                      val f = ex.getTrackFormat(i)
+                      if (f.getString(MediaFormat.KEY_MIME)!!.startsWith("audio/")) {
+                          idx = i
+                          fmt = f
+                          break
+                      }
+                  }
+                  require(idx >= 0 && fmt != null) { "No audio track found" }
+                  ex.selectTrack(idx)
+                  val codec = MediaCodec.createDecoderByType(fmt!!.getString(MediaFormat.KEY_MIME)!!)
+                  codec.configure(fmt, null, null, 0)
+                  codec.start()
+                  var rate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                  var ch = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                  val pcm = ByteArrayOutputStream()
+                  val info = MediaCodec.BufferInfo()
+                  var inDone = false
+                  var outDone = false
+                  while (!outDone) {
+                      if (!inDone) {
+                          val i = codec.dequeueInputBuffer(10000)
+                          if (i >= 0) {
+                              val buf = codec.getInputBuffer(i)!!
+                              val n = ex.readSampleData(buf, 0)
+                              if (n < 0) {
+                                  codec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                  inDone = true
+                              } else {
+                                  codec.queueInputBuffer(i, 0, n, ex.sampleTime, 0)
+                                  ex.advance()
+                              }
+                          }
+                      }
+                      val o = codec.dequeueOutputBuffer(info, 10000)
+                      if (o >= 0) {
+                          val out = codec.getOutputBuffer(o)!!
+                          out.position(info.offset)
+                          out.limit(info.offset + info.size)
+                          val chunk = ByteArray(info.size)
+                          out.get(chunk)
+                          pcm.write(chunk)
+                          codec.releaseOutputBuffer(o, false)
+                          if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true
+                      } else if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          val nf = codec.outputFormat
+                          rate = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                          ch = nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                      }
+                  }
+                  codec.stop()
+                  codec.release()
+                  ex.release()
+                  val sb = ByteBuffer.wrap(pcm.toByteArray()).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                  val frames = sb.remaining() / ch
+                  val mono = FloatArray(frames)
+                  for (f in 0 until frames) {
+                      var s = 0f
+                      for (c in 0 until ch) s += sb.get(f * ch + c)
+                      mono[f] = s / ch / 32768f
+                  }
+                  if (rate == 16000) return mono
+                  val outLen = (frames.toLong() * 16000 / rate).toInt()
+                  val res = FloatArray(outLen)
+                  for (i in 0 until outLen) {
+                      val p = i.toDouble() * rate / 16000
+                      val a = p.toInt().coerceAtMost(frames - 1)
+                      val b = (a + 1).coerceAtMost(frames - 1)
+                      val fr = (p - a).toFloat()
+                      res[i] = mono[a] * (1 - fr) + mono[b] * fr
+                  }
+                  return res
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  scope.cancel()
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build release APK (arm64 only, optimized)
+        run: gradle :app:assembleRelease -Pandroid.injected.build.abi=arm64-v8a --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhisperGGUF-apk
+          path: app/build/outputs/apk/release/*.apk
